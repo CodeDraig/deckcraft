@@ -9,7 +9,6 @@ use crate::tools::{call_tool, tool_definitions};
 
 /// The MCP revision we implement.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-const SUPPORTED_VERSIONS: &[&str] = &[PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -79,15 +78,6 @@ impl Server {
             return None;
         }
         let reply = match serde_json::from_str::<Value>(line) {
-            Ok(Value::Array(batch)) => {
-                // Batches were removed in 2025-06-18; still answer older clients sensibly.
-                if batch.is_empty() {
-                    Some(error(Value::Null, INVALID_REQUEST, "empty batch"))
-                } else {
-                    let replies: Vec<Value> = batch.into_iter().filter_map(|m| self.handle(m)).collect();
-                    (!replies.is_empty()).then_some(Value::Array(replies))
-                }
-            }
             Ok(msg) => self.handle(msg),
             Err(e) => Some(error(Value::Null, PARSE_ERROR, format!("parse error: {e}"))),
         };
@@ -129,22 +119,18 @@ impl Server {
 
     fn request(&mut self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
         match method {
-            "initialize" => {
-                let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
-                let version = if SUPPORTED_VERSIONS.contains(&asked) { asked } else { PROTOCOL_VERSION };
-                Ok(json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {}, "resources": {}},
-                    "serverInfo": {"name": "deckcraft", "title": "DeckCraft", "version": env!("CARGO_PKG_VERSION"), "websiteUrl": deckcraft_engine::links::APP_PAGE},
-                    "instructions": format!(
-                        "{INSTRUCTIONS} Backend: {}. Community: {} (Discord), {} (app page), {} (source). The `app.links` command returns these links.",
-                        self.backend.describe(),
-                        deckcraft_engine::links::DISCORD,
-                        deckcraft_engine::links::APP_PAGE,
-                        deckcraft_engine::links::GITHUB
-                    ),
-                }))
-            }
+            "initialize" => Ok(json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}, "resources": {}},
+                "serverInfo": {"name": "deckcraft", "title": "DeckCraft", "version": env!("CARGO_PKG_VERSION"), "websiteUrl": deckcraft_engine::links::APP_PAGE},
+                "instructions": format!(
+                    "{INSTRUCTIONS} Backend: {}. Community: {} (Discord), {} (app page), {} (source). The `app.links` command returns these links.",
+                    self.backend.describe(),
+                    deckcraft_engine::links::DISCORD,
+                    deckcraft_engine::links::APP_PAGE,
+                    deckcraft_engine::links::GITHUB
+                ),
+            })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tool_definitions()})),
             "tools/call" => {

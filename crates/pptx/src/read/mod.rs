@@ -1,6 +1,17 @@
 //! PPTX import: package → [`Presentation`].
 
+mod markup;
+pub use markup::{keep_xml, resolve_mc};
+
+mod properties;
+use properties::{header_footer, read_core, read_show};
+
+mod parts;
+pub use parts::color_map;
+use parts::{read_master, read_notes, read_slide};
+
 mod chart;
+mod comments;
 pub(crate) mod dml;
 mod shapes;
 mod theme;
@@ -8,19 +19,15 @@ mod timing;
 
 pub(crate) use chart::{chart_from as chart_from_el, read_chart_xml};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use deckcraft_geom::{Size, emu_to_pt};
-use deckcraft_model::text::TextBody;
-use deckcraft_model::{
-    Background, Comment, CustomShow, HeaderFooter, Layout, LayoutId, LayoutType, Master, MasterId, MediaId, MediaItem, PhType, Presentation,
-    Properties, Section, ShowSettings, Slide, SlideId, defaults,
-};
+use deckcraft_model::{CustomShow, LayoutId, Master, MasterId, MediaId, MediaItem, Presentation, Section, SlideId, defaults};
 
 use crate::PptxError;
 use crate::opc::{self, Package, Rels};
-use crate::xml::{Doc, El, Node};
+use crate::xml::{Doc, El};
 
 /// Import state shared by all parts.
 pub struct Imp<'a> {
@@ -78,84 +85,6 @@ impl Part {
     /// Serialize an element with the namespace declarations it needs from the part root.
     pub fn keep(&self, el: &El) -> String {
         keep_xml(el, &self.ns)
-    }
-}
-
-/// Serialize `el`, declaring every prefix it uses that the source root declared.
-pub fn keep_xml(el: &El, ns: &[(String, String)]) -> String {
-    let mut used = HashSet::new();
-    fn rec(e: &El, used: &mut HashSet<String>, depth: usize) {
-        if depth > crate::xml::MAX_DEPTH {
-            return;
-        }
-        if let Some((p, _)) = e.name.split_once(':') {
-            used.insert(p.to_string());
-        }
-        for (k, _) in &e.attrs {
-            if let Some((p, _)) = k.split_once(':')
-                && p != "xmlns"
-                && p != "xml"
-            {
-                used.insert(p.to_string());
-            }
-        }
-        for c in e.elements() {
-            rec(c, used, depth + 1);
-        }
-    }
-    rec(el, &mut used, 0);
-    let mut el = el.clone();
-    for (k, v) in ns {
-        let p = k.strip_prefix("xmlns:").unwrap_or("");
-        if !p.is_empty() && used.contains(p) && !el.attrs.iter().any(|(a, _)| a == k) {
-            el.attrs.push((k.clone(), v.clone()));
-        }
-    }
-    el.to_xml()
-}
-
-/// Namespace prefixes whose `mc:Choice` content we understand.
-const SUPPORTED_MC: [&str; 9] = ["p14", "p15", "p159", "a14", "a16", "p1510", "a15", "c14", "p188"];
-
-/// Replace every `mc:AlternateContent` by the children of the branch we can read best.
-pub fn resolve_mc(el: &mut El, depth: usize) {
-    if depth > crate::xml::MAX_DEPTH {
-        return;
-    }
-    if el.children.iter().any(|c| matches!(c, Node::El(e) if e.is("AlternateContent"))) {
-        let mut out = Vec::with_capacity(el.children.len());
-        for c in std::mem::take(&mut el.children) {
-            match c {
-                Node::El(ac) if ac.is("AlternateContent") => {
-                    let choice = ac.children_named("Choice").find(|ch| {
-                        let req_ok = ch.attr("Requires").unwrap_or("").split_whitespace().all(|r| SUPPORTED_MC.contains(&r));
-                        // Ink content parts are not modelled; prefer their fallback picture.
-                        let modelled = !ch.elements().any(|e| e.is("contentPart"));
-                        req_ok && modelled
-                    });
-                    let branch = choice.or_else(|| ac.child("Fallback"));
-                    if let Some(b) = branch {
-                        for n in &b.children {
-                            if let Node::El(e) = n {
-                                let mut e = e.clone();
-                                // Carry namespace declarations from the branch onto its content.
-                                for (k, v) in b.attrs.iter().chain(ac.attrs.iter()) {
-                                    if k.starts_with("xmlns") && !e.attrs.iter().any(|(a, _)| a == k) {
-                                        e.attrs.push((k.clone(), v.clone()));
-                                    }
-                                }
-                                out.push(Node::El(e));
-                            }
-                        }
-                    }
-                }
-                other => out.push(other),
-            }
-        }
-        el.children = out;
-    }
-    for c in el.elements_mut() {
-        resolve_mc(c, depth + 1);
     }
 }
 
@@ -288,13 +217,16 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
     }
     let fallback_layout = p.masters.first().and_then(|m| m.layouts.first()).map(|l| l.id).unwrap_or_default();
 
+    let comment_authors = comments::authors(&pkg, &pres_part)?;
+
     // Slides.
     let mut file_slide_ids: HashMap<u32, SlideId> = HashMap::new();
     for (file_id, path, id) in &slide_ids {
         let Some(doc) = docs.get(&opc::norm(path)) else { continue };
         let part = Part::new(&pkg, path, doc);
         let layout = part.rels.first_of("slideLayout").and_then(|r| layout_by_part.get(&opc::norm(&r.target)).copied()).unwrap_or(fallback_layout);
-        let mut slide = read_slide(&mut imp, &part, doc, *id, layout);
+        let mut shape_ids = shapes::IdCtx::default();
+        let mut slide = read_slide(&mut imp, &part, doc, *id, layout, &mut shape_ids);
         // Notes.
         if let Some(n) = part.rels.first_of("notesSlide")
             && let Some(nd) = load(&pkg, &n.target)
@@ -304,9 +236,10 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
         }
         // Comments.
         for c in part.rels.all_of("comments") {
-            if let Some(cd) = pkg.xml(&c.target) {
-                slide.comments.extend(read_comments(&pkg, &pres_part, &cd.root));
+            if c.external || c.kind_uri != crate::comments::RT_COMMENTS {
+                return Err(PptxError::Unsupported("comments must use the modern internal comment relationship".into()));
             }
+            slide.comments.extend(comments::read(&pkg, &c.target, &comment_authors, &shape_ids, *file_id)?);
         }
         file_slide_ids.insert(*file_id, *id);
         p.slides.push(Arc::new(slide));
@@ -413,287 +346,4 @@ pub fn has_rel_refs(el: &El) -> bool {
         own || e.elements().any(|c| rec(c, depth + 1))
     }
     rec(el, 0)
-}
-
-pub fn color_map(cm: &El) -> Vec<(String, String)> {
-    cm.attrs.iter().filter(|(k, _)| !k.starts_with("xmlns")).map(|(k, v)| (k.clone(), v.clone())).collect()
-}
-
-fn background(imp: &mut Imp, part: &Part, csld: &El) -> Option<Background> {
-    let bg = csld.child("bg")?;
-    if let Some(pr) = bg.child("bgPr") {
-        return Some(Background::Fill { fill: dml::fill_of(imp, part, pr).unwrap_or(deckcraft_model::Fill::None) });
-    }
-    let r = bg.child("bgRef")?;
-    Some(Background::Ref {
-        idx: r.u32("idx").unwrap_or(1001),
-        color: dml::color(r).unwrap_or(deckcraft_model::ColorRef::scheme(deckcraft_color::SchemeSlot::Bg1)),
-    })
-}
-
-fn read_master(imp: &mut Imp, path: &str, doc: &Doc, docs: &HashMap<String, Doc>, layout_by_part: &mut HashMap<String, LayoutId>) -> Master {
-    let pkg = imp.pkg;
-    let part = Part::new(pkg, path, doc);
-    let root = &doc.root;
-    let mut m = Master { id: MasterId(0), preserve: root.bool("preserve").unwrap_or(false), ..Default::default() };
-    if let Some(t) = part.rels.first_of("theme")
-        && let Some(td) = pkg.xml(&t.target)
-    {
-        let tp = Part::new(pkg, &t.target, &td);
-        m.theme = theme::read_theme(imp, &tp, &td.root);
-    }
-    m.id = MasterId(imp.alloc());
-    if let Some(cm) = root.child("clrMap") {
-        m.color_map = color_map(cm);
-    }
-    if let Some(csld) = root.child("cSld") {
-        m.name = csld.attr("name").unwrap_or("").to_string();
-        m.background = background(imp, &part, csld);
-        if let Some(tree) = csld.child("spTree") {
-            let mut ctx = shapes::IdCtx::default();
-            m.shapes = shapes::sp_tree(imp, &part, &mut ctx, tree, 0);
-        }
-    }
-    if m.name.is_empty() {
-        m.name = m.theme.name.clone();
-    }
-    if let Some(ts) = root.child("txStyles") {
-        if let Some(s) = ts.child("titleStyle") {
-            m.title_style = dml::list_style(imp, &part, s);
-        }
-        if let Some(s) = ts.child("bodyStyle") {
-            m.body_style = dml::list_style(imp, &part, s);
-        }
-        if let Some(s) = ts.child("otherStyle") {
-            m.other_style = dml::list_style(imp, &part, s);
-        }
-    }
-    // Layouts in list order, then any other related layouts.
-    let mut lpaths: Vec<String> = root
-        .child("sldLayoutIdLst")
-        .map(|l| l.children_named("sldLayoutId").filter_map(|x| part.rels.target(x.attr("r:id").unwrap_or(""))).map(String::from).collect())
-        .unwrap_or_default();
-    for r in part.rels.all_of("slideLayout") {
-        if !lpaths.iter().any(|x| opc::norm(x) == opc::norm(&r.target)) {
-            lpaths.push(r.target.clone());
-        }
-    }
-    for lp in lpaths.iter().take(1000) {
-        let key = opc::norm(lp);
-        if layout_by_part.contains_key(&key) {
-            continue;
-        }
-        let Some(ld) = docs.get(&key) else { continue };
-        let lpart = Part::new(pkg, lp, ld);
-        let l = read_layout(imp, &lpart, ld);
-        layout_by_part.insert(key, l.id);
-        m.layouts.push(l);
-    }
-    if m.layouts.is_empty() {
-        // A master must have a layout for slides to use.
-        imp.next = imp.next.saturating_add(1);
-        m.layouts.push(Layout {
-            id: LayoutId(imp.next),
-            name: "Blank".into(),
-            kind: LayoutType::Blank,
-            show_master_shapes: true,
-            ..Default::default()
-        });
-    }
-    if let Some(ext) = root.child("extLst").filter(|e| !has_rel_refs(e)) {
-        m.raw_ext = Some(ext.elements().map(|e| part.keep(e)).collect());
-    }
-    m
-}
-
-fn read_layout(imp: &mut Imp, part: &Part, doc: &Doc) -> Layout {
-    let root = &doc.root;
-    let mut l = Layout {
-        id: LayoutId(imp.alloc()),
-        kind: LayoutType::from_xml(root.attr("type").unwrap_or("cust")),
-        show_master_shapes: root.bool("showMasterSp").unwrap_or(true),
-        preserve: root.bool("preserve").unwrap_or(false),
-        ..Default::default()
-    };
-    if let Some(csld) = root.child("cSld") {
-        l.name = csld.attr("name").unwrap_or("").to_string();
-        l.background = background(imp, part, csld);
-        if let Some(tree) = csld.child("spTree") {
-            let mut ctx = shapes::IdCtx::default();
-            l.shapes = shapes::sp_tree(imp, part, &mut ctx, tree, 0);
-        }
-    }
-    if let Some(ext) = root.child("extLst").filter(|e| !has_rel_refs(e)) {
-        l.raw_ext = Some(ext.elements().map(|e| part.keep(e)).collect());
-    }
-    l
-}
-
-fn read_slide(imp: &mut Imp, part: &Part, doc: &Doc, id: SlideId, layout: LayoutId) -> Slide {
-    let root = &doc.root;
-    let mut s = Slide {
-        id,
-        layout,
-        hidden: root.bool("show") == Some(false),
-        show_master_shapes: root.bool("showMasterSp").unwrap_or(true),
-        ..Default::default()
-    };
-    let mut ctx = shapes::IdCtx::default();
-    if let Some(csld) = root.child("cSld") {
-        s.name = csld.attr("name").unwrap_or("").to_string();
-        s.background = background(imp, part, csld);
-        if let Some(tree) = csld.child("spTree") {
-            s.shapes = shapes::sp_tree(imp, part, &mut ctx, tree, 0);
-        }
-    }
-    if let Some(t) = root.child("transition") {
-        s.transition = timing::transition(imp, part, t);
-    }
-    if let Some(t) = root.child("timing") {
-        s.animations = timing::animations(imp, part, &ctx, t, &s.shapes);
-    }
-    if let Some(ext) = root.child("extLst").filter(|e| !has_rel_refs(e)) {
-        s.raw_ext = Some(ext.elements().map(|e| part.keep(e)).collect());
-    }
-    s
-}
-
-fn read_notes(imp: &mut Imp, part: &Part, root: &El) -> TextBody {
-    let Some(tree) = root.path(&["cSld", "spTree"]) else { return TextBody::default() };
-    for sp in tree.children_named("sp") {
-        let ph = sp.path(&["nvSpPr", "nvPr", "ph"]);
-        let is_body = ph.is_some_and(|ph| matches!(ph.attr("type"), Some("body") | None) && ph.attr("type") != Some("sldImg"));
-        if is_body && let Some(tx) = sp.child("txBody") {
-            let mut t = dml::text_body(imp, part, tx);
-            // Notes keep only content: drop body formatting from the notes master placeholder.
-            t.list_style = Default::default();
-            if t.is_empty() {
-                return TextBody::default();
-            }
-            return t;
-        }
-    }
-    TextBody::default()
-}
-
-fn read_comments(pkg: &Package, pres: &Part, root: &El) -> Vec<Comment> {
-    // Authors: legacy commentAuthors.xml (numeric ids) and modern authors.xml (GUIDs).
-    let mut authors: HashMap<String, (String, String)> = HashMap::new();
-    for kind in ["commentAuthors", "authors"] {
-        if let Some(r) = pres.rels.first_of(kind)
-            && let Some(d) = pkg.xml(&r.target)
-        {
-            for a in d.root.elements() {
-                if let Some(id) = a.attr("id") {
-                    authors.insert(id.to_string(), (a.attr("name").unwrap_or("").to_string(), a.attr("initials").unwrap_or("").to_string()));
-                }
-            }
-        }
-    }
-    fn one(e: &El, authors: &HashMap<String, (String, String)>, depth: usize) -> Comment {
-        let (author, initials) = e.attr("authorId").and_then(|a| authors.get(a).cloned()).unwrap_or_default();
-        let text = if let Some(t) = e.child("text") {
-            t.text()
-        } else if let Some(tb) = e.child("txBody") {
-            tb.children_named("p").map(|p| p.text()).collect::<Vec<_>>().join("\n")
-        } else {
-            String::new()
-        };
-        let pos = e.child("pos");
-        let replies = if depth < 4 {
-            e.child("replyLst").map(|l| l.children_named("reply").take(1000).map(|r| one(r, authors, depth + 1)).collect()).unwrap_or_default()
-        } else {
-            vec![]
-        };
-        Comment {
-            author,
-            initials,
-            text,
-            date: e.attr("dt").or(e.attr("created")).unwrap_or("").to_string(),
-            x: pos.and_then(|p| p.f64("x")).unwrap_or(0.0) / 8.0,
-            y: pos.and_then(|p| p.f64("y")).unwrap_or(0.0) / 8.0,
-            resolved: e.attr("status") == Some("resolved"),
-            replies,
-            shape: None,
-        }
-    }
-    root.children_named("cm").take(10_000).map(|c| one(c, &authors, 0)).collect()
-}
-
-fn read_show(sp: &El, shows: &HashMap<String, String>) -> ShowSettings {
-    let mut s = ShowSettings {
-        loop_until_esc: sp.bool("loop").unwrap_or(false),
-        without_narration: sp.bool("showNarration") == Some(false),
-        without_animation: sp.bool("showAnimation") == Some(false),
-        use_timings: sp.bool("useTimings").unwrap_or(true),
-        ..Default::default()
-    };
-    if sp.child("browse").is_some() {
-        s.show_type = "browsed".into();
-    } else if sp.child("kiosk").is_some() {
-        s.show_type = "kiosk".into();
-    }
-    if let Some(r) = sp.child("sldRg") {
-        s.range = Some((r.u32("st").unwrap_or(1).max(1), r.u32("end").unwrap_or(1).max(1)));
-    }
-    if let Some(c) = sp.child("custShow") {
-        let id = c.attr("id").unwrap_or("");
-        s.custom_show = Some(shows.get(id).cloned().unwrap_or_else(|| id.to_string()));
-    }
-    if let Some(c) = sp.child("penClr").and_then(dml::color)
-        && let deckcraft_model::ColorBase::Rgb { rgb } = c.base
-    {
-        s.pen_color = rgb;
-    }
-    s
-}
-
-fn read_core(root: &El, p: &mut Properties) {
-    for e in root.elements() {
-        let t = e.text();
-        match e.local() {
-            "title" => p.title = t,
-            "subject" => p.subject = t,
-            "creator" => p.author = t,
-            "keywords" => p.keywords = t,
-            "description" => p.comments = t,
-            "category" => p.category = t,
-            "lastModifiedBy" => p.last_modified_by = t,
-            "revision" => p.revision = t.trim().parse().unwrap_or(0),
-            "created" => p.created = t,
-            "modified" => p.modified = t,
-            _ => {}
-        }
-    }
-}
-
-/// Which footer placeholders the slides show.
-fn header_footer(p: &Presentation) -> HeaderFooter {
-    let mut hf = HeaderFooter::default();
-    for s in &p.slides {
-        for sh in &s.shapes {
-            match sh.ph_type() {
-                Some(PhType::SlideNum) => hf.slide_number = true,
-                Some(PhType::Date) => {
-                    hf.date = true;
-                    if let Some(t) = &sh.text
-                        && !t.paragraphs.iter().flat_map(|p| &p.runs).any(|r| matches!(r.kind, deckcraft_model::text::RunKind::Field { .. }))
-                        && hf.date_text.is_empty()
-                    {
-                        hf.date_text = t.text();
-                    }
-                }
-                Some(PhType::Footer) => {
-                    hf.footer = true;
-                    if hf.footer_text.is_empty()
-                        && let Some(t) = &sh.text
-                    {
-                        hf.footer_text = t.text();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    hf
 }

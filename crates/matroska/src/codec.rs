@@ -23,8 +23,7 @@ pub enum Codec {
     Mjpeg,
     /// `V_MS/VFW/FOURCC` with any other FourCC; `bitmap_info_header` is the whole `CodecPrivate`.
     VfwFourcc { fourcc: [u8; 4], bitmap_info_header: Vec<u8> },
-    /// `A_AAC` (and the legacy `A_AAC/MPEG{2,4}/<profile>` IDs); `asc` is the
-    /// `AudioSpecificConfig` (synthesised for legacy IDs without `CodecPrivate`).
+    /// `A_AAC`; `asc` is the `AudioSpecificConfig` supplied in `CodecPrivate`.
     Aac { asc: Vec<u8> },
     /// `A_OPUS`; `head` is the `OpusHead` identification header.
     Opus { head: Vec<u8> },
@@ -91,24 +90,6 @@ impl Codec {
     }
 }
 
-const AAC_RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
-
-/// Build a 2-byte (or 5-byte with SBR extension) AudioSpecificConfig for legacy `A_AAC/...` IDs.
-fn synth_asc(object_type: u8, rate: f64, out_rate: Option<f64>, channels: u64, sbr: bool) -> Vec<u8> {
-    let rate_index = |r: f64| AAC_RATES.iter().position(|&x| x as f64 == r).unwrap_or(4) as u8;
-    let ri = rate_index(rate);
-    let ch = channels.min(7) as u8;
-    let mut v = vec![(object_type << 3) | (ri >> 1), ((ri & 1) << 7) | (ch << 3)];
-    if sbr {
-        // backward-compatible explicit signalling: sync 0x2b7, SBR object type 5, flag, ext rate index
-        let ext = rate_index(out_rate.unwrap_or(rate * 2.0));
-        v.push(0x56);
-        v.push(0xE5);
-        v.push(0x80 | (ext << 3));
-    }
-    v
-}
-
 /// Split a Xiph-laced `CodecPrivate` (Vorbis/Theora headers).
 fn split_xiph(p: &[u8]) -> Vec<Vec<u8>> {
     let Some(&n) = p.first() else { return Vec::new() };
@@ -136,7 +117,7 @@ fn split_xiph(p: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Map a CodecID + CodecPrivate (+ audio params for legacy AAC / PCM) to a [`Codec`].
+/// Map a CodecID + CodecPrivate (+ audio parameters for PCM) to a [`Codec`].
 pub(crate) fn map_codec(id: &str, private: &[u8], audio: Option<&crate::AudioInfo>) -> Codec {
     let p = private.to_vec();
     match id {
@@ -164,31 +145,14 @@ pub(crate) fn map_codec(id: &str, private: &[u8], audio: Option<&crate::AudioInf
             let bits = audio.and_then(|a| a.bit_depth).unwrap_or(if id == "A_PCM/FLOAT/IEEE" { 32 } else { 16 }) as u16;
             Codec::Pcm { float: id == "A_PCM/FLOAT/IEEE", big_endian: id == "A_PCM/INT/BIG", bits }
         }
-        "A_AC3" | "A_AC3/BSID9" | "A_AC3/BSID10" => Codec::Ac3,
+        "A_AC3" => Codec::Ac3,
         "A_EAC3" => Codec::Eac3,
         "A_MPEG/L3" => Codec::Mp3,
         "A_MPEG/L2" => Codec::Mp2,
         "S_TEXT/UTF8" => Codec::SubRip,
         "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" | "D_WEBVTT/DESCRIPTIONS" | "D_WEBVTT/METADATA" => Codec::WebVtt,
-        "S_TEXT/ASS" | "S_ASS" => Codec::Ass { header: p, ssa: false },
-        "S_TEXT/SSA" | "S_SSA" => Codec::Ass { header: p, ssa: true },
-        _ if id.starts_with("A_AAC/") => {
-            if !private.is_empty() {
-                return Codec::Aac { asc: p };
-            }
-            let (rate, out_rate, ch) = audio.map_or((48000.0, None, 2), |a| (a.sampling_frequency, a.output_sampling_frequency, a.channels));
-            let object_type = if id.ends_with("/MAIN") {
-                1
-            } else if id.ends_with("/SSR") {
-                3
-            } else if id.ends_with("/LTP") {
-                4
-            } else {
-                2
-            };
-            let sbr = id.ends_with("/SBR");
-            Codec::Aac { asc: synth_asc(object_type, rate, out_rate, ch, sbr) }
-        }
+        "S_TEXT/ASS" => Codec::Ass { header: p, ssa: false },
+        "S_TEXT/SSA" => Codec::Ass { header: p, ssa: true },
         _ => Codec::Other(id.to_string()),
     }
 }
@@ -209,8 +173,11 @@ mod tests {
         let a = crate::AudioInfo { sampling_frequency: 44100.0, channels: 2, bit_depth: Some(24), output_sampling_frequency: None };
         assert_eq!(map_codec("A_PCM/INT/LIT", &[], Some(&a)).name(), "pcm_s24le");
         assert_eq!(map_codec("A_PCM/FLOAT/IEEE", &[], Some(&a)), Codec::Pcm { float: true, big_endian: false, bits: 24 });
-        // legacy AAC LC 44.1k stereo → 0x12 0x10
-        assert_eq!(map_codec("A_AAC/MPEG4/LC", &[], Some(&a)), Codec::Aac { asc: vec![0x12, 0x10] });
+        // AAC configuration comes from the current A_AAC track contract.
+        assert_eq!(map_codec("A_AAC", &[0x12, 0x10], Some(&a)), Codec::Aac { asc: vec![0x12, 0x10] });
+        for id in ["A_AAC/MPEG4/LC", "S_ASS", "S_SSA", "A_AC3/BSID9", "A_AC3/BSID10"] {
+            assert_eq!(map_codec(id, &[0x12, 0x10], Some(&a)), Codec::Other(id.into()));
+        }
         assert_eq!(map_codec("S_TEXT/UTF8", &[], None).name(), "subrip");
         assert_eq!(map_codec("X_WHATEVER", &[], None), Codec::Other("X_WHATEVER".into()));
     }

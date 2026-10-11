@@ -7,24 +7,33 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod text;
+use text::prompt_body;
+pub use text::{draw_layout, draw_layout_with, draw_text};
+
+mod stroke;
+use stroke::{arrowheads, stroke};
+
+mod geometry;
+pub use geometry::{crop_dest, parse_path, shape_geometry};
+
+mod image;
+pub use image::Image;
+
 mod chart;
 mod images;
 mod paint;
 mod placed;
 mod table;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use deckcraft_color::Rgba;
-use deckcraft_fonts::FontDb;
-use deckcraft_geom::preset::{self, FillMode, Geometry, SubPath};
+use deckcraft_geom::preset::{FillMode, Geometry};
 use deckcraft_model::resolve::{self, Ctx};
-use deckcraft_model::style::{Effects, Fill, Line};
+use deckcraft_model::style::{Effects, Fill};
 use deckcraft_model::text::TextBody;
-use deckcraft_model::{Geom, PhType, Presentation, Shape, ShapeId, ShapeKind, Slide};
+use deckcraft_model::{PhType, Presentation, Shape, ShapeId, ShapeKind, Slide};
 use deckcraft_text::{Fields, Opts};
-use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape as _, Vec2};
+use kurbo::{Affine, BezPath, Point, Rect, Shape as _, Vec2};
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_cpu::{RenderContext, Resources, peniko};
 
@@ -33,61 +42,6 @@ pub use placed::{Placed, PlacedLink, PlacedText, place_slide};
 
 /// Largest pixmap side we render (vello_cpu uses u16 sizes).
 pub const MAX_SIDE: u32 = 16_000;
-
-/// A rendered image: premultiplied RGBA8.
-#[derive(Clone, Debug, Default)]
-pub struct Image {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-}
-
-impl Image {
-    /// Straight (unpremultiplied) RGBA.
-    pub fn to_straight(&self) -> Vec<u8> {
-        let mut out = self.pixels.clone();
-        for px in out.as_chunks_mut::<4>().0 {
-            let a = px.get(3).copied().unwrap_or(255) as u32;
-            if a != 0 && a != 255 {
-                for c in px.iter_mut().take(3) {
-                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
-                }
-            }
-        }
-        out
-    }
-    pub fn to_png(&self) -> Vec<u8> {
-        let mut px = self.to_straight();
-        px.resize(self.width as usize * self.height as usize * 4, 0);
-        let Some(img) = image::RgbaImage::from_raw(self.width, self.height, px) else { return Vec::new() };
-        let mut buf = Vec::new();
-        if let Err(e) = img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png) {
-            log::error!("PNG encode: {e}");
-            return Vec::new();
-        }
-        buf
-    }
-    pub fn to_jpeg(&self, quality: u8) -> Vec<u8> {
-        let straight = self.to_straight();
-        let rgb: Vec<u8> = straight.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
-        let Some(img) = image::RgbImage::from_raw(self.width, self.height, rgb) else { return Vec::new() };
-        let mut buf = Vec::new();
-        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality.clamp(1, 100));
-        if let Err(e) = img.write_with_encoder(enc) {
-            log::error!("JPEG encode: {e}");
-            return Vec::new();
-        }
-        buf
-    }
-    /// Pixel at (x, y) as straight RGBA.
-    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
-        let i = (y as usize * self.width as usize + x as usize) * 4;
-        let p = self.pixels.get(i..i + 4).unwrap_or(&[0, 0, 0, 0]);
-        let a = p.get(3).copied().unwrap_or(0) as u32;
-        let un = |c: u8| (c as u32 * 255 + a / 2).checked_div(a).map(|v| v.min(255) as u8).unwrap_or(0);
-        [un(p[0]), un(p[1]), un(p[2]), a as u8]
-    }
-}
 
 /// Animation state of one shape during a slide show or preview.
 #[derive(Clone, Debug)]
@@ -273,95 +227,6 @@ fn shade(c: Rgba, m: FillMode) -> Rgba {
         FillMode::DarkenLess => c.lerp(Rgba::BLACK.with_alpha(c.a), 0.2),
         _ => c,
     }
-}
-
-/// Geometry of a shape at its size.
-pub fn shape_geometry(shape: &Shape, w: f64, h: f64) -> Geometry {
-    match &shape.geom {
-        Geom::Preset { name, adj } => preset::build(name, w, h, adj).or_else(|| preset::build("rect", w, h, &[])).unwrap_or(Geometry {
-            paths: vec![],
-            text_rect: Rect::new(0.0, 0.0, w, h),
-            handles: vec![],
-            sites: vec![],
-        }),
-        Geom::Custom { paths } => {
-            let mut out = vec![];
-            for p in paths {
-                let (pw, ph) = (if p.w > 0.0 { p.w } else { w.max(1e-9) }, if p.h > 0.0 { p.h } else { h.max(1e-9) });
-                let mut bp = parse_path(&p.d);
-                bp.apply_affine(Affine::scale_non_uniform(w / pw, h / ph));
-                out.push(SubPath { path: bp, fill: p.fill, stroke: p.stroke, even_odd: false });
-            }
-            Geometry { paths: out, text_rect: Rect::new(0.0, 0.0, w, h), handles: vec![], sites: vec![] }
-        }
-    }
-}
-
-/// Parse our custom path syntax (`M x y L x y C … Q … Z`).
-pub fn parse_path(d: &str) -> BezPath {
-    let mut bp = BezPath::new();
-    let toks: Vec<&str> = d.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).collect();
-    let mut i = 0;
-    let num = |i: usize| toks.get(i).and_then(|t| t.parse::<f64>().ok()).filter(|v| v.is_finite());
-    let mut started = false;
-    while i < toks.len() {
-        let t = toks.get(i).copied().unwrap_or("");
-        match t {
-            "M" => {
-                if let (Some(x), Some(y)) = (num(i + 1), num(i + 2)) {
-                    bp.move_to((x, y));
-                    started = true;
-                }
-                i += 3;
-            }
-            "L" => {
-                if let (Some(x), Some(y)) = (num(i + 1), num(i + 2)) {
-                    if !started {
-                        bp.move_to((x, y));
-                        started = true;
-                    } else {
-                        bp.line_to((x, y));
-                    }
-                }
-                i += 3;
-            }
-            "C" => {
-                if let (Some(a), Some(b), Some(c), Some(d2), Some(e), Some(f)) =
-                    (num(i + 1), num(i + 2), num(i + 3), num(i + 4), num(i + 5), num(i + 6))
-                    && started
-                {
-                    bp.curve_to((a, b), (c, d2), (e, f));
-                }
-                i += 7;
-            }
-            "Q" => {
-                if let (Some(a), Some(b), Some(c), Some(d2)) = (num(i + 1), num(i + 2), num(i + 3), num(i + 4))
-                    && started
-                {
-                    bp.quad_to((a, b), (c, d2));
-                }
-                i += 5;
-            }
-            "Z" | "z" => {
-                if started {
-                    bp.close_path();
-                }
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    bp
-}
-
-/// The rectangle a picture's image occupies given its crop (fractions; negative = padding).
-pub fn crop_dest(bounds: Rect, crop: [f64; 4]) -> Rect {
-    let [l, t, r, b] = crop.map(|v| if v.is_finite() { v.clamp(-10.0, 0.99) } else { 0.0 });
-    let vis_w = (1.0 - l - r).max(1e-6);
-    let vis_h = (1.0 - t - b).max(1e-6);
-    let fw = bounds.width() / vis_w;
-    let fh = bounds.height() / vis_h;
-    Rect::new(bounds.x0 - l * fw, bounds.y0 - t * fh, bounds.x0 - l * fw + fw, bounds.y0 - t * fh + fh)
 }
 
 struct Frame<'a> {
@@ -744,262 +609,6 @@ pub(crate) fn scale_of(m: Affine) -> f64 {
 
 fn blur(sigma: f64) -> Filter {
     Filter::from_primitive(FilterPrimitive::GaussianBlur { std_deviation: sigma.clamp(0.0, 500.0) as f32, edge_mode: EdgeMode::None })
-}
-
-fn stroke(ctx: &mut RenderContext, rctx: &Ctx, line: &Line, ph: Option<Rgba>, path: &BezPath, m: Affine, lw: f64) {
-    use deckcraft_model::style::{LineCap, LineJoin};
-    let cap = match line.cap.unwrap_or_default() {
-        LineCap::Flat => kurbo::Cap::Butt,
-        LineCap::Round => kurbo::Cap::Round,
-        LineCap::Square => kurbo::Cap::Square,
-    };
-    let join = match line.join.unwrap_or_default() {
-        LineJoin::Round => kurbo::Join::Round,
-        LineJoin::Bevel => kurbo::Join::Bevel,
-        LineJoin::Miter => kurbo::Join::Miter,
-    };
-    // Hairlines stay visible at any zoom.
-    let min_w = 0.5 / scale_of(m).max(1e-6);
-    let mut sk = kurbo::Stroke::new(lw.max(min_w)).with_caps(cap).with_join(join);
-    if let Some(d) = &line.dash {
-        let pat: Vec<f64> = d.pattern().iter().map(|v| v * lw.max(0.75)).collect();
-        if !pat.is_empty() && pat.iter().all(|v| *v > 0.0) {
-            sk = sk.with_dashes(0.0, pat);
-        }
-    }
-    ctx.set_transform(m);
-    match &line.fill {
-        Some(Fill::Solid { color: c }) => {
-            ctx.set_paint(color(rctx.color(c, ph), 1.0));
-        }
-        Some(Fill::Gradient(g)) => {
-            let c = g.stops.first().map(|s| rctx.color(&s.color, ph)).unwrap_or(Rgba::BLACK);
-            ctx.set_paint(color(c, 1.0));
-        }
-        _ => ctx.set_paint(peniko::Color::from_rgba8(0, 0, 0, 255)),
-    }
-    ctx.set_stroke(sk);
-    ctx.stroke_path(path);
-}
-
-fn end_points(path: &BezPath) -> Option<((Point, Point), (Point, Point))> {
-    let els: Vec<PathEl> = path.elements().to_vec();
-    let mut pts: Vec<Point> = vec![];
-    for e in &els {
-        match e {
-            PathEl::MoveTo(p) | PathEl::LineTo(p) => pts.push(*p),
-            PathEl::QuadTo(a, b) => {
-                pts.push(*a);
-                pts.push(*b);
-            }
-            PathEl::CurveTo(a, b, c) => {
-                pts.push(*a);
-                pts.push(*b);
-                pts.push(*c);
-            }
-            PathEl::ClosePath => {}
-        }
-    }
-    if pts.len() < 2 {
-        return None;
-    }
-    let first = *pts.first()?;
-    let second = pts.iter().skip(1).find(|p| (**p - first).hypot() > 1e-6).copied().unwrap_or(*pts.get(1)?);
-    let last = *pts.last()?;
-    let prev = pts.iter().rev().skip(1).find(|p| (**p - last).hypot() > 1e-6).copied().unwrap_or(*pts.get(pts.len() - 2)?);
-    Some(((first, second), (last, prev)))
-}
-
-fn arrowheads(ctx: &mut RenderContext, rctx: &Ctx, line: &Line, ph: Option<Rgba>, geo: &Geometry, m: Affine, lw: f64) {
-    let Some(sp) = geo.paths.iter().find(|p| p.stroke) else { return };
-    let Some(((a, a2), (b, b2))) = end_points(&sp.path) else { return };
-    let col = match &line.fill {
-        Some(Fill::Solid { color: c }) => rctx.color(c, ph),
-        _ => Rgba::BLACK,
-    };
-    let lw = lw.max(0.75);
-    for (end, tip, from) in [(&line.head, a, a2), (&line.tail, b, b2)] {
-        let Some(e) = end else { continue };
-        if e.kind == "none" {
-            continue;
-        }
-        let sz = |s: &str| match s {
-            "sm" => 2.0,
-            "lg" => 5.0,
-            _ => 3.0,
-        };
-        let (wl, ll) = (sz(&e.w) * lw, sz(&e.len) * lw);
-        let dir = (tip - from).normalize();
-        if !dir.x.is_finite() {
-            continue;
-        }
-        let n = Vec2::new(-dir.y, dir.x);
-        let base = tip - dir * ll;
-        let mut p = BezPath::new();
-        match e.kind.as_str() {
-            "oval" => {
-                let c = kurbo::Ellipse::new(tip, (ll / 2.0, wl / 2.0), dir.y.atan2(dir.x));
-                p = c.to_path(0.05);
-            }
-            "diamond" => {
-                p.move_to(tip + dir * ll / 2.0);
-                p.line_to(tip + n * wl / 2.0);
-                p.line_to(tip - dir * ll / 2.0);
-                p.line_to(tip - n * wl / 2.0);
-                p.close_path();
-            }
-            "stealth" => {
-                p.move_to(tip);
-                p.line_to(base + n * wl / 2.0);
-                p.line_to(tip - dir * ll * 0.6);
-                p.line_to(base - n * wl / 2.0);
-                p.close_path();
-            }
-            "arrow" => {
-                let mut o = BezPath::new();
-                o.move_to(base + n * wl / 2.0);
-                o.line_to(tip);
-                o.line_to(base - n * wl / 2.0);
-                ctx.set_transform(m);
-                ctx.set_paint(color(col, 1.0));
-                ctx.set_stroke(kurbo::Stroke::new(lw).with_join(kurbo::Join::Miter));
-                ctx.stroke_path(&o);
-                continue;
-            }
-            _ => {
-                p.move_to(tip);
-                p.line_to(base + n * wl / 2.0);
-                p.line_to(base - n * wl / 2.0);
-                p.close_path();
-            }
-        }
-        ctx.set_transform(m);
-        ctx.set_paint(color(col, 1.0));
-        ctx.fill_path(&p);
-    }
-}
-
-/// The prompt shown in an empty placeholder, formatted like its content would be.
-fn prompt_body(rctx: &Ctx, s: &Shape, kind: PhType) -> TextBody {
-    // Layout/master prompt text when the layout supplies a custom one.
-    let (lp, _) = resolve::parents(rctx, s);
-    let custom = lp.and_then(|l| l.ph.as_ref().filter(|p| p.has_custom_prompt).and(l.text.as_ref())).filter(|t| !t.is_empty());
-    if let Some(t) = custom {
-        return t.clone();
-    }
-    if matches!(rctx.owner, resolve::Owner::Layout | resolve::Owner::Master) {
-        return TextBody::default();
-    }
-    let txt = kind.prompt();
-    if txt.is_empty() || kind.is_footer_kind() {
-        return TextBody::default();
-    }
-    let mut t = TextBody::from_text(txt);
-    if matches!(kind, PhType::Picture | PhType::Chart | PhType::Table | PhType::Media | PhType::Diagram | PhType::ClipArt) {
-        t.body.anchor = Some(deckcraft_model::text::Anchor::Bottom);
-        if let Some(p) = t.paragraphs.first_mut() {
-            p.props.align = Some(deckcraft_model::text::Align::Center);
-            p.props.bullet = Some(deckcraft_model::text::Bullet::None);
-            p.props.margin_left = Some(0.0);
-            p.props.indent = Some(0.0);
-            for r in &mut p.runs {
-                r.props.size = Some(14.0);
-            }
-        }
-    }
-    t
-}
-
-thread_local! {
-    static GLYPH_CACHE: std::cell::RefCell<HashMap<(u32, u32), Arc<BezPath>>> = std::cell::RefCell::new(HashMap::new());
-}
-
-fn glyph(face: &deckcraft_fonts::FontFace, gid: u32) -> Arc<BezPath> {
-    let key = (face.id(), gid);
-    if let Some(p) = GLYPH_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return p;
-    }
-    let p = FontDb::global().outline(face, gid);
-    GLYPH_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() > 200_000 {
-            c.clear();
-        }
-        c.insert(key, p.clone());
-    });
-    p
-}
-
-/// Draw a text body into shape space `m` within the text rect.
-pub fn draw_text(ctx: &mut RenderContext, rctx: &Ctx, s: &Shape, body: &TextBody, tr: Rect, m: Affine, fields: &dyn Fields, prompt: Option<Rgba>) {
-    let l = deckcraft_text::layout(rctx, s, body, &Opts { rect: tr, fields, prompt_color: prompt, no_shrink: false });
-    draw_layout(ctx, &l, tr, m);
-}
-
-/// Draw an already laid-out text block.
-pub fn draw_layout(ctx: &mut RenderContext, l: &deckcraft_text::TextLayout, tr: Rect, m: Affine) {
-    draw_layout_with(ctx, l, tr, m, &[]);
-}
-
-/// Draw a laid-out text block with per-paragraph animation states.
-pub fn draw_layout_with(ctx: &mut RenderContext, l: &deckcraft_text::TextLayout, tr: Rect, m: Affine, paras: &[(usize, ParaState)]) {
-    let para = |i: usize| paras.iter().find(|(p, _)| *p == i).map(|(_, s)| *s).unwrap_or_default();
-    let m = if l.rotation != 0.0 {
-        let c = tr.center().to_vec2();
-        m * Affine::translate(c) * Affine::rotate(l.rotation.to_radians()) * Affine::translate(-c)
-    } else {
-        m
-    };
-    let deco = |ctx: &mut RenderContext, d: &deckcraft_text::Deco| {
-        let ps = para(d.para);
-        if !ps.visible || ps.opacity <= 0.001 {
-            return;
-        }
-        ctx.set_transform(m * Affine::translate(ps.offset));
-        ctx.set_paint(color(d.color, ps.opacity));
-        ctx.fill_rect(&d.rect);
-    };
-    for d in l.decos.iter().filter(|d| d.behind) {
-        deco(ctx, d);
-    }
-    for run in &l.runs {
-        if (run.alpha <= 0.0 || run.color.a == 0) && run.outline.is_none() {
-            continue;
-        }
-        let ps = para(run.para);
-        if !ps.visible || ps.opacity <= 0.001 {
-            continue;
-        }
-        let m = m * Affine::translate(ps.offset);
-        let alpha = run.alpha * ps.opacity;
-        let k = run.size / run.face.upem.max(1.0);
-        ctx.set_paint(color(run.color, alpha));
-        for (gid, x, y) in &run.glyphs {
-            let path = glyph(&run.face, *gid);
-            if path.elements().is_empty() {
-                continue;
-            }
-            let skew = if run.fake_italic { Affine::new([1.0, 0.0, -0.2, 1.0, 0.0, 0.0]) } else { Affine::IDENTITY };
-            let gm = m * Affine::translate((*x, *y)) * skew * Affine::scale(k);
-            ctx.set_transform(gm);
-            if alpha > 0.0 && run.color.a > 0 {
-                ctx.fill_path(&path);
-                if run.fake_bold {
-                    ctx.set_stroke(kurbo::Stroke::new(run.face.upem * 0.025).with_join(kurbo::Join::Round));
-                    ctx.stroke_path(&path);
-                }
-            }
-            if let Some((oc, ow)) = run.outline {
-                ctx.set_paint(color(oc, ps.opacity));
-                ctx.set_stroke(kurbo::Stroke::new(ow / k.max(1e-9)).with_join(kurbo::Join::Round));
-                ctx.stroke_path(&path);
-                ctx.set_paint(color(run.color, alpha));
-            }
-        }
-    }
-    for d in l.decos.iter().filter(|d| !d.behind) {
-        deco(ctx, d);
-    }
 }
 
 /// Render one shape alone onto a transparent canvas (drag previews, copy as picture).

@@ -7,6 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod comments;
 mod custgeom;
 mod maps;
 mod opc;
@@ -16,7 +17,8 @@ mod tables;
 mod write;
 mod xml;
 
-use deckcraft_model::Presentation;
+pub use read::import;
+pub use write::export;
 
 /// Extension URI of the PowerPoint 2010 section list in `presentation.xml`.
 pub(crate) const SECTION_EXT_URI: &str = "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}";
@@ -36,16 +38,6 @@ pub enum PptxError {
 /// Does this look like an OOXML package (zip with `[Content_Types].xml`)?
 pub fn sniff(bytes: &[u8]) -> bool {
     bytes.starts_with(b"PK") && bytes.windows(19).take(4096).any(|w| w == b"[Content_Types].xml")
-}
-
-/// Read a `.pptx` / `.potx` / `.ppsx` package.
-pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
-    read::import(bytes)
-}
-
-/// Write a `.pptx` package.
-pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
-    write::export(p)
 }
 
 /// Content type for a file name's extension.

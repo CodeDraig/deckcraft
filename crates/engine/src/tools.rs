@@ -1,6 +1,16 @@
 //! Pointer tools. Gestures arrive in slide coordinates (points) through [`Session::pointer`] from
 //! the UI, the control channel or MCP alike; each finished gesture is one undo step.
 
+mod snap;
+
+mod hit_test;
+use hit_test::deckcraft_render_cell;
+pub use hit_test::text_pos;
+
+mod transform;
+use transform::constrain_45;
+pub use transform::{box_handles, line_xfrm, resize_box};
+
 use std::sync::Arc;
 
 use deckcraft_geom::{Affine, Point, Rect, Vec2, Xfrm};
@@ -9,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cmd::{self, xfrm_of};
-use crate::{HistoryEntry, Result, Session, TextSel};
+use crate::{HistoryEntry, Result, Session};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,71 +201,12 @@ impl ToolState {
     }
 }
 
-/// Handle positions in slide coordinates for a box (8 resize + rotate).
-pub fn box_handles(x: &Xfrm) -> ([Point; 8], Point) {
-    let a = x.affine();
-    let (w, h) = (x.w, x.h);
-    let local = [(0.0, 0.0), (w / 2.0, 0.0), (w, 0.0), (w, h / 2.0), (w, h), (w / 2.0, h), (0.0, h), (0.0, h / 2.0)];
-    let pts = local.map(|(px, py)| a * Point::new(px, py));
-    // The rotation handle sits above the top edge (in the shape's rotated frame).
-    let up = if x.flip_v { 1.0 } else { -1.0 };
-    let rot =
-        Affine::translate(Vec2::new(x.x + w / 2.0, x.y + h / 2.0)) * Affine::rotate(x.rot.to_radians()) * Point::new(0.0, up * (h / 2.0 + 20.0));
-    (pts, rot)
-}
-
 impl Session {
     pub fn set_tool(&mut self, kind: ToolKind) {
         self.tool.kind = kind;
         self.tool.drag = None;
         self.tool.preview = None;
         self.tool.marquee = None;
-    }
-
-    /// What's under `p` on the current slide.
-    pub fn hit_test(&self, p: Point, tol: f64) -> Option<Hit> {
-        let st = self.active()?;
-        // Handles of selected shapes first.
-        if st.selection.text.is_none() || st.selection.shapes.len() == 1 {
-            for id in st.selection.shapes.iter().rev() {
-                let Some(sh) = st.shape(*id) else { continue };
-                let x = xfrm_of(&st.doc, &st.selection, sh);
-                if sh.is_line() {
-                    let a = x.affine();
-                    for (end, q) in [(0u8, a * Point::new(0.0, 0.0)), (1u8, a * Point::new(x.w, x.h))] {
-                        if (q - p).hypot() <= tol * 1.6 {
-                            return Some(Hit::LineEnd { id: *id, end });
-                        }
-                    }
-                    continue;
-                }
-                let geo = deckcraft_render::shape_geometry(sh, x.w, x.h);
-                for hd in &geo.handles {
-                    if (x.affine() * hd.pos - p).hypot() <= tol * 1.6 {
-                        return Some(Hit::Adjust { id: *id, index: hd.index });
-                    }
-                }
-                let (pts, rot) = box_handles(&x);
-                if (rot - p).hypot() <= tol * 1.8 && st.selection.text.is_none() {
-                    return Some(Hit::Rotate { id: *id });
-                }
-                for (i, q) in pts.iter().enumerate() {
-                    if (*q - p).hypot() <= tol * 1.6 {
-                        return Some(Hit::Resize { id: *id, handle: i as u8 });
-                    }
-                }
-            }
-        }
-        // Shapes, topmost first.
-        for sh in st.shapes().iter().rev() {
-            if sh.hidden || sh.locked {
-                continue;
-            }
-            if let Some(h) = hit_shape(st, sh, p, tol) {
-                return Some(h);
-            }
-        }
-        None
     }
 
     /// Feed a pointer event to the active tool. Returns what happened (for agents).
@@ -914,104 +865,6 @@ impl Session {
         })
     }
 
-    /// Smart guides: snap `r` edges/centres to the slide and other shapes. Returns the offset to
-    /// apply and the guides to draw.
-    fn snap_rect(&self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool) -> (Vec2, Vec<Guide>) {
-        let Some(st) = self.active() else { return (Vec2::ZERO, vec![]) };
-        if !enabled || !self.prefs.smart_guides {
-            return (Vec2::ZERO, vec![]);
-        }
-        let size = st.doc.slide_size;
-        let mut xs: Vec<(f64, Rect)> = vec![
-            (0.0, Rect::new(0.0, 0.0, 0.0, size.height)),
-            (size.width / 2.0, Rect::new(size.width / 2.0, 0.0, size.width / 2.0, size.height)),
-            (size.width, Rect::new(size.width, 0.0, size.width, size.height)),
-        ];
-        let mut ys: Vec<(f64, Rect)> = vec![
-            (0.0, Rect::new(0.0, 0.0, size.width, 0.0)),
-            (size.height / 2.0, Rect::new(0.0, size.height / 2.0, size.width, size.height / 2.0)),
-            (size.height, Rect::new(0.0, size.height, size.width, size.height)),
-        ];
-        for sh in st.shapes() {
-            if exclude.contains(&sh.id) || sh.hidden {
-                continue;
-            }
-            let b = xfrm_of(&st.doc, &st.selection, sh).bounds();
-            for x in [b.x0, b.center().x, b.x1] {
-                xs.push((x, b));
-            }
-            for y in [b.y0, b.center().y, b.y1] {
-                ys.push((y, b));
-            }
-        }
-        let mut best_x: Option<(f64, f64, Rect)> = None;
-        for edge in [r.x0, r.center().x, r.x1] {
-            for (x, b) in &xs {
-                let d = x - edge;
-                if d.abs() <= tol && best_x.is_none_or(|(bd, _, _)| d.abs() < bd.abs()) {
-                    best_x = Some((d, *x, *b));
-                }
-            }
-        }
-        let mut best_y: Option<(f64, f64, Rect)> = None;
-        for edge in [r.y0, r.center().y, r.y1] {
-            for (y, b) in &ys {
-                let d = y - edge;
-                if d.abs() <= tol && best_y.is_none_or(|(bd, _, _)| d.abs() < bd.abs()) {
-                    best_y = Some((d, *y, *b));
-                }
-            }
-        }
-        let mut off = Vec2::ZERO;
-        let mut guides = vec![];
-        if let Some((d, x, b)) = best_x {
-            off.x = d;
-            let rr = r + Vec2::new(d, 0.0);
-            guides.push(Guide { vertical: true, pos: x, from: b.y0.min(rr.y0), to: b.y1.max(rr.y1) });
-        } else if self.prefs.snap_to_grid {
-            off.x = deckcraft_geom::snap(r.x0, self.prefs.grid_spacing) - r.x0;
-        }
-        if let Some((d, y, b)) = best_y {
-            off.y = d;
-            let rr = r + Vec2::new(0.0, d);
-            guides.push(Guide { vertical: false, pos: y, from: b.x0.min(rr.x0), to: b.x1.max(rr.x1) });
-        } else if self.prefs.snap_to_grid {
-            off.y = deckcraft_geom::snap(r.y0, self.prefs.grid_spacing) - r.y0;
-        }
-        (off, guides)
-    }
-
-    fn snap_resize(&mut self, x: Xfrm, _orig: &Xfrm, handle: u8, id: ShapeId, tol: f64) -> Xfrm {
-        if x.rot != 0.0 {
-            self.tool.guides.clear();
-            return x;
-        }
-        let r = x.rect();
-        let (off, guides) = self.snap_rect(r, &[id], tol * 1.5, true);
-        let mut nx = x;
-        // Only the dragged edges move.
-        let moves_left = matches!(handle, 0 | 6 | 7);
-        let moves_right = matches!(handle, 2..=4);
-        let moves_top = matches!(handle, 0..=2);
-        let moves_bottom = matches!(handle, 4..=6);
-        if moves_left {
-            nx.x += off.x;
-            nx.w -= off.x;
-        } else if moves_right {
-            nx.w += off.x;
-        }
-        if moves_top {
-            nx.y += off.y;
-            nx.h -= off.y;
-        } else if moves_bottom {
-            nx.h += off.y;
-        }
-        nx.w = nx.w.max(0.0);
-        nx.h = nx.h.max(0.0);
-        self.tool.guides = guides;
-        nx
-    }
-
     fn add_ink(&mut self, points: Vec<(f64, f64, f32)>) -> Result<Value> {
         let ToolKind::Ink { mode, color, width } = self.tool.kind.clone() else { return Ok(Value::Null) };
         let stroke = deckcraft_model::InkStroke { points, color, width, highlighter: mode == "highlighter" };
@@ -1071,213 +924,6 @@ fn is_text_first(st: &crate::DocState, id: ShapeId) -> bool {
 
 fn contains_rect(outer: Rect, inner: Rect) -> bool {
     inner.x0 >= outer.x0 && inner.y0 >= outer.y0 && inner.x1 <= outer.x1 && inner.y1 <= outer.y1
-}
-
-fn constrain_45(a: Point, b: Point) -> Point {
-    let d = b - a;
-    let ang = d.y.atan2(d.x);
-    let snapped = (ang / std::f64::consts::FRAC_PI_4).round() * std::f64::consts::FRAC_PI_4;
-    let len = d.hypot();
-    a + Vec2::new(snapped.cos(), snapped.sin()) * len
-}
-
-/// A line-like shape's box for endpoints `a` → `b` (flips encode direction).
-pub fn line_xfrm(a: Point, b: Point, _rot: f64) -> Xfrm {
-    let r = Rect::from_points(a, b);
-    Xfrm { x: r.x0, y: r.y0, w: r.width(), h: r.height(), rot: 0.0, flip_h: b.x < a.x, flip_v: b.y < a.y }
-}
-
-/// New box when dragging resize handle `h` by `d` (slide space), keeping the shape's rotation.
-pub fn resize_box(o: &Xfrm, h: u8, d: Vec2, keep_aspect: bool, from_center: bool) -> Xfrm {
-    // Work in the shape's rotated frame.
-    let rot = Affine::rotate(-o.rot.to_radians());
-    let ld = rot * Point::new(d.x, d.y);
-    let (mut l, mut t, mut r, mut b) = (0.0, 0.0, o.w, o.h);
-    let (sx, sy) = (if o.flip_h { -1.0 } else { 1.0 }, if o.flip_v { -1.0 } else { 1.0 });
-    let (dx, dy) = (ld.x * sx, ld.y * sy);
-    match h {
-        0 => {
-            l += dx;
-            t += dy;
-        }
-        1 => t += dy,
-        2 => {
-            r += dx;
-            t += dy;
-        }
-        3 => r += dx,
-        4 => {
-            r += dx;
-            b += dy;
-        }
-        5 => b += dy,
-        6 => {
-            l += dx;
-            b += dy;
-        }
-        _ => l += dx,
-    }
-    if from_center {
-        // Symmetric growth about the centre.
-        let gw = match h {
-            0 | 6 | 7 => -dx,
-            2..=4 => dx,
-            _ => 0.0,
-        };
-        let gh = match h {
-            0..=2 => -dy,
-            4..=6 => dy,
-            _ => 0.0,
-        };
-        l = -gw;
-        r = o.w + gw;
-        t = -gh;
-        b = o.h + gh;
-    }
-    let mut w = r - l;
-    let mut hh = b - t;
-    if keep_aspect && o.w > 1e-9 && o.h > 1e-9 && !matches!(h, 1 | 3 | 5 | 7) {
-        let ar = o.w / o.h;
-        if (w / ar).abs() > hh.abs() {
-            hh = w.abs() / ar * hh.signum().max(if hh == 0.0 { 1.0 } else { hh.signum() });
-        } else {
-            w = hh.abs() * ar * w.signum().max(if w == 0.0 { 1.0 } else { w.signum() });
-        }
-        if matches!(h, 0 | 6) {
-            l = r - w;
-        } else {
-            r = l + w;
-        }
-        if matches!(h, 0 | 2) {
-            t = b - hh;
-        } else {
-            b = t + hh;
-        }
-        if from_center {
-            let (cx, cy) = (o.w / 2.0, o.h / 2.0);
-            l = cx - w / 2.0;
-            r = cx + w / 2.0;
-            t = cy - hh / 2.0;
-            b = cy + hh / 2.0;
-        }
-    }
-    // Dragging past the opposite edge flips.
-    let (mut fh, mut fv) = (o.flip_h, o.flip_v);
-    if r < l {
-        std::mem::swap(&mut l, &mut r);
-        fh = !fh;
-    }
-    if b < t {
-        std::mem::swap(&mut t, &mut b);
-        fv = !fv;
-    }
-    let (nw, nh) = (r - l, b - t);
-    // New centre in slide space: old centre + rotated offset of the local centre change.
-    let local_c = Point::new((l + r) / 2.0 * sx + if sx < 0.0 { o.w } else { 0.0 }, (t + b) / 2.0 * sy + if sy < 0.0 { o.h } else { 0.0 });
-    let c = o.affine() * Point::new(if o.flip_h { o.w - local_c.x } else { local_c.x }, if o.flip_v { o.h - local_c.y } else { local_c.y });
-    Xfrm { x: c.x - nw / 2.0, y: c.y - nh / 2.0, w: nw, h: nh, rot: o.rot, flip_h: fh, flip_v: fv }
-}
-
-fn hit_shape(st: &crate::DocState, sh: &Shape, p: Point, tol: f64) -> Option<Hit> {
-    let x = xfrm_of(&st.doc, &st.selection, sh);
-    let inv = x.affine().inverse();
-    let local = inv * p;
-    match &sh.kind {
-        ShapeKind::Group { children, child } => {
-            // A group is hit when any child is hit; the group is what gets selected.
-            let ch = Rect::new(child.x, child.y, child.x + child.w, child.y + child.h);
-            let m = deckcraft_geom::group_child_affine(&x, ch);
-            let q = m.inverse() * p;
-            for c in children.iter().rev() {
-                if let Some(cx) = c.xfrm {
-                    let cl = cx.affine().inverse() * q;
-                    if cl.x >= -tol && cl.y >= -tol && cl.x <= cx.w + tol && cl.y <= cx.h + tol {
-                        return Some(Hit::Shape { id: sh.id, text: false });
-                    }
-                }
-            }
-            None
-        }
-        ShapeKind::Ink { strokes } => {
-            for s in strokes {
-                if s.points.iter().any(|(px, py, _)| (Point::new(*px, *py) - p).hypot() <= tol + s.width) {
-                    return Some(Hit::Shape { id: sh.id, text: false });
-                }
-            }
-            None
-        }
-        _ => {
-            if sh.is_line() {
-                let geo = deckcraft_render::shape_geometry(sh, x.w, x.h);
-                let lw = sh.line.as_ref().and_then(|l| l.width).unwrap_or(1.0);
-                if deckcraft_geom::near_path(&geo.outline(), local, tol.max(lw)) {
-                    return Some(Hit::Shape { id: sh.id, text: false });
-                }
-                return None;
-            }
-            let inside = local.x >= -tol && local.y >= -tol && local.x <= x.w + tol && local.y <= x.h + tol;
-            if !inside {
-                return None;
-            }
-            let has_text = matches!(sh.kind, ShapeKind::Shape) && (sh.text.as_ref().is_some_and(|t| !t.is_empty()) || sh.ph.is_some() || sh.text_box);
-            // Empty interiors of unfilled, text-less shapes don't catch clicks.
-            let filled = !matches!(sh.fill, Some(deckcraft_model::Fill::None)) || sh.style.is_some();
-            let geo = deckcraft_render::shape_geometry(sh, x.w, x.h);
-            let in_geo = {
-                use deckcraft_geom::KurboShape;
-                geo.outline().winding(local) != 0 || deckcraft_geom::near_path(&geo.outline(), local, tol)
-            };
-            if has_text
-                || sh.ph.is_some()
-                || matches!(
-                    sh.kind,
-                    ShapeKind::Picture { .. } | ShapeKind::Table(_) | ShapeKind::Chart(_) | ShapeKind::Media(_) | ShapeKind::Opaque { .. }
-                )
-                || (filled && in_geo)
-                || deckcraft_geom::near_path(&geo.outline(), local, tol)
-            {
-                return Some(Hit::Shape { id: sh.id, text: has_text || matches!(sh.kind, ShapeKind::Shape) });
-            }
-            None
-        }
-    }
-}
-
-/// Text position under slide point `p` in shape `sh`.
-pub fn text_pos(st: &crate::DocState, sh: &Shape, p: Point) -> (usize, usize) {
-    let x = xfrm_of(&st.doc, &st.selection, sh);
-    let local = x.affine().inverse() * p;
-    let t = TextSel { shape: sh.id, ..Default::default() };
-    match cmd::text::layout_for(st, &t) {
-        Some(l) => {
-            let h = l.hit(local);
-            (h.para, h.ch)
-        }
-        None => (0, 0),
-    }
-}
-
-/// Which table cell contains a table-local point.
-fn deckcraft_render_cell(t: &deckcraft_model::Table, p: Point) -> (usize, usize) {
-    let mut y = 0.0;
-    let mut row = t.rows.len().saturating_sub(1);
-    for (i, r) in t.rows.iter().enumerate() {
-        if p.y < y + r.height {
-            row = i;
-            break;
-        }
-        y += r.height;
-    }
-    let mut x = 0.0;
-    let mut col = t.cols.len().saturating_sub(1);
-    for (i, w) in t.cols.iter().enumerate() {
-        if p.x < x + w {
-            col = i;
-            break;
-        }
-        x += w;
-    }
-    (row, col)
 }
 
 #[cfg(test)]

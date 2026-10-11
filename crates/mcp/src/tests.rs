@@ -89,3 +89,18 @@ fn errors_are_reported_not_panics() {
     let r = call(&mut s, 3, "tools/call", json!({"name": "add_shape", "arguments": {"preset": "rect"}}));
     assert_eq!(r["result"]["isError"], true);
 }
+
+#[test]
+fn only_the_declared_protocol_and_single_message_framing_are_supported() {
+    let mut s = Server::new(Box::new(Headless::new()));
+    for requested in ["2025-06-18", "2025-03-26", "2024-11-05"] {
+        let r = call(&mut s, 1, "initialize", json!({"protocolVersion": requested}));
+        assert_eq!(r["result"]["protocolVersion"], crate::server::PROTOCOL_VERSION);
+    }
+    let batch = json!([{"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "new_presentation", "arguments": {}}}]);
+    let response: Value = serde_json::from_str(&s.handle_line(&batch.to_string()).unwrap()).unwrap();
+    assert_eq!(response["error"]["code"], -32600);
+    let inspect = call(&mut s, 3, "tools/call", json!({"name": "inspect_document", "arguments": {}}));
+    assert_eq!(inspect["result"]["isError"], true);
+}

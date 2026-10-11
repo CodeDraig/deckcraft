@@ -25,3 +25,6 @@ i_overlay = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 image = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"

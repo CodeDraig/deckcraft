@@ -83,7 +83,8 @@ fn synthetic() -> Vec<u8> {
     let mut a = Vec::new();
     el_uint(&mut a, TRACK_NUMBER, 2);
     el_uint(&mut a, TRACK_TYPE, 2);
-    el_str(&mut a, CODEC_ID, "A_AAC/MPEG4/LC/SBR");
+    el_str(&mut a, CODEC_ID, "A_AAC");
+    el(&mut a, CODEC_PRIVATE, &[0x13, 0x10, 0x56, 0xE5, 0x98]);
     el_str(&mut a, LANGUAGE, "ger");
     let mut au = Vec::new();
     el_float(&mut au, SAMPLING_FREQUENCY, 24000.0);
@@ -172,7 +173,7 @@ fn synthetic_file() {
     assert_eq!(m.white_point, (0.3127, 0.329));
     assert_eq!((m.luminance_max, m.luminance_min), (1000.0, 0.0001));
     assert_eq!(v.encodings, vec![ContentEncoding::HeaderStripping { bytes: vec![0, 0, 0, 1], scope: 1 }]);
-    // legacy AAC ID: ASC synthesised with explicit SBR signalling (LC, 24 kHz, stereo → 48 kHz)
+    // A_AAC retains its explicit SBR configuration (LC, 24 kHz, stereo → 48 kHz).
     assert_eq!(f.tracks[1].codec, Codec::Aac { asc: vec![0x13, 0x10, 0x56, 0xE5, 0x98] });
     assert_eq!(f.tracks[1].language, "ger");
     assert_eq!(f.chapters[0].chapters[0].title(), Some("Intro"));

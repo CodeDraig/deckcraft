@@ -62,7 +62,7 @@ DeckCraft is in early development, heading for its first alpha (see the [roadmap
 Today it can:
 
 - **Make decks**: slide masters and eleven layouts with placeholders that inherit position and
-  formatting, eight original themes with colour and font schemes, sections, notes, comments,
+  formatting, eight original themes with colour and font schemes, sections, notes, threaded comments,
   headers and footers, custom slide sizes.
 - **Draw**: 150+ preset shapes with adjust handles, connectors that stay glued to shapes, freeform,
   curve and scribble tools, merge shapes (union, combine, fragment, intersect, subtract), gradient,
@@ -78,6 +78,19 @@ Today it can:
   with selectable text), PNG/JPEG and outlines. Unsaved work is kept by AutoRecover.
 - **Automate**: 200+ commands with undo, all scriptable from the CLI, a JSON control channel and an
   MCP server for AI agents.
+
+PPTX comments use the modern PowerPoint comment format for both import and export. Threads,
+author names and initials, creation dates, resolved state, positions, and slide/shape anchors
+round-trip. Classic comments are rejected. Unknown and text-range anchors, opaque-shape anchors
+on export, nested replies, task properties, comment extensions (such as reactions), multiple
+anchors, and comments without valid creation dates or XML-safe text return an explicit error.
+
+Native `.deckcraft` archives use format version 1. The former SlideCraft archive signature and
+other format versions are rejected.
+
+Matroska AAC tracks use `A_AAC` with their actual `CodecPrivate` configuration. Superseded
+profile-specific AAC identifiers, `S_ASS`/`S_SSA`, and `A_AC3/BSID9`/`A_AC3/BSID10` are no longer
+decoded through aliases; current subtitle and AC-3 IDs are `S_TEXT/ASS`, `S_TEXT/SSA`, and `A_AC3`.
 
 <table>
   <tr>
@@ -108,6 +121,9 @@ Fonts come from [craft-fonts](https://github.com/storytold/craft-fonts): clone i
 fonts.
 
 ## Agents, CLI and MCP
+
+The MCP server advertises revision `2025-06-18` and accepts one JSON-RPC object per line.
+Array batches are rejected without execution; use the `batch` tool for ordered commands.
 
 Every action in DeckCraft is a command with a stable id, so people, scripts and AI agents use the
 same verbs:

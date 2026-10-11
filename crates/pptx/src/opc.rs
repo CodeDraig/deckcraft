@@ -105,7 +105,13 @@ impl Package {
             let (Some(id), Some(ty), Some(target)) = (r.attr("Id"), r.attr("Type"), r.attr("Target")) else { continue };
             let external = r.attr("TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("external"));
             let target = if external { target.to_string() } else { resolve(&base, target) };
-            out.items.push(Rel { id: id.to_string(), kind: ty.rsplit('/').next().unwrap_or(ty).to_string(), target, external });
+            out.items.push(Rel {
+                id: id.to_string(),
+                kind: ty.rsplit('/').next().unwrap_or(ty).to_string(),
+                kind_uri: ty.to_string(),
+                target,
+                external,
+            });
         }
         out
     }
@@ -131,6 +137,7 @@ impl Package {
 
 #[derive(Clone, Debug, Default)]
 pub struct Rel {
+    pub kind_uri: String,
     pub id: String,
     /// Last segment of the relationship type (`slide`, `image`, `media`…).
     pub kind: String,

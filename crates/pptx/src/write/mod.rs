@@ -1,6 +1,13 @@
 //! PPTX export: [`Presentation`] → package.
 
+mod properties;
+use properties::{app_xml, core_xml, pres_props_xml, presentation_xml, view_props_xml};
+
+mod parts;
+use parts::{clr_map, csld, layout_xml, master_xml, notes_master_shapes, notes_style, notes_xml, slide_xml};
+
 mod chart;
+mod comments;
 pub(crate) mod dml;
 mod shapes;
 mod theme;
@@ -9,14 +16,10 @@ mod timing;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use deckcraft_geom::Xfrm;
-use deckcraft_model::text::{Paragraph, TextBody};
-use deckcraft_model::{
-    Background, Comment, Layout, LayoutId, Master, MediaId, PhType, Placeholder, Presentation, Shape, ShapeId, Slide, SlideId, defaults,
-};
+use deckcraft_model::{Background, Layout, LayoutId, MediaId, Presentation, SlideId, defaults};
 
 use crate::PptxError;
-use crate::opc::{self, NS_A, NS_P, NS_P14, NS_R, PackageOut, RelsOut};
+use crate::opc::{self, NS_A, NS_P, NS_R, PackageOut, RelsOut};
 use crate::xml::{A, W};
 
 const CT_PRES: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml";
@@ -30,8 +33,7 @@ const CT_PRES_PROPS: &str = "application/vnd.openxmlformats-officedocument.prese
 const CT_VIEW_PROPS: &str = "application/vnd.openxmlformats-officedocument.presentationml.viewProps+xml";
 const CT_TABLE_STYLES: &str = "application/vnd.openxmlformats-officedocument.presentationml.tableStyles+xml";
 const CT_CHART: &str = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
-const CT_COMMENTS: &str = "application/vnd.openxmlformats-officedocument.presentationml.comments+xml";
-const CT_AUTHORS: &str = "application/vnd.openxmlformats-officedocument.presentationml.commentAuthors+xml";
+
 const CT_CORE: &str = "application/vnd.openxmlformats-package.core-properties+xml";
 const CT_APP: &str = "application/vnd.openxmlformats-officedocument.extended-properties+xml";
 
@@ -172,74 +174,6 @@ fn root_open(w: &mut W, tag: &str, extra: A) {
     w.open(tag, a);
 }
 
-fn background(w: &mut W, x: &mut Exp, o: &mut Out, bg: &Background) {
-    w.open0("p:bg");
-    match bg {
-        Background::Fill { fill } => {
-            w.open0("p:bgPr");
-            match fill {
-                deckcraft_model::Fill::Background | deckcraft_model::Fill::Group => w.empty0("a:noFill"),
-                f => dml::fill(w, x, o, f),
-            }
-            w.empty0("a:effectLst");
-            w.close("p:bgPr");
-        }
-        Background::Ref { idx, color } => {
-            let idx = if (1..=3).contains(idx) || (1001..=1003).contains(idx) { *idx } else { 1001 };
-            w.open("p:bgRef", A::new().a("idx", idx));
-            dml::color(w, color);
-            w.close("p:bgRef");
-        }
-    }
-    w.close("p:bg");
-}
-
-fn csld(w: &mut W, x: &mut Exp, o: &mut Out, name: &str, bg: Option<&Background>, list: &[Shape]) -> shapes::IdMap {
-    w.open("p:cSld", A::new().o("name", (!name.is_empty()).then_some(name)));
-    if let Some(bg) = bg {
-        background(w, x, o, bg);
-    }
-    w.open0("p:spTree");
-    shapes::tree_header(w);
-    let mut ids = shapes::IdMap::build(list);
-    {
-        let mut cx = shapes::Ctx { ids: &mut ids, written: Default::default() };
-        shapes::shapes(w, x, o, &mut cx, list, 0);
-    }
-    w.close("p:spTree");
-    w.close("p:cSld");
-    ids
-}
-
-const CLR_KEYS: [(&str, &str); 12] = [
-    ("bg1", "lt1"),
-    ("tx1", "dk1"),
-    ("bg2", "lt2"),
-    ("tx2", "dk2"),
-    ("accent1", "accent1"),
-    ("accent2", "accent2"),
-    ("accent3", "accent3"),
-    ("accent4", "accent4"),
-    ("accent5", "accent5"),
-    ("accent6", "accent6"),
-    ("hlink", "hlink"),
-    ("folHlink", "folHlink"),
-];
-
-fn clr_map(w: &mut W, map: &[(String, String)]) {
-    let mut a = A::new();
-    for (k, d) in CLR_KEYS {
-        let v = map
-            .iter()
-            .find(|(mk, _)| mk == k)
-            .map(|(_, v)| v.as_str())
-            .filter(|v| deckcraft_color::SchemeSlot::from_xml(v).is_some_and(|s| deckcraft_color::SchemeSlot::THEME.contains(&s)))
-            .unwrap_or(d);
-        a = a.a(k, v);
-    }
-    w.empty("p:clrMap", a);
-}
-
 fn ext_list(w: &mut W, raw: Option<&str>) {
     let Some(raw) = raw.filter(|r| !r.trim().is_empty()) else { return };
     // Only keep well-formed extension elements.
@@ -264,64 +198,6 @@ fn ext_children(raw: Option<&str>) -> Option<String> {
         return Some(d.root.elements().map(|e| crate::read::keep_xml(e, &ns)).collect());
     }
     Some(raw.to_string())
-}
-
-fn notes_master_shapes(size: deckcraft_geom::Size) -> Vec<Shape> {
-    let (w, h) = (size.width, size.height);
-    let mk = |id: u32, name: &str, kind: PhType, idx: u32, x: f64, y: f64, ww: f64, hh: f64| Shape {
-        id: ShapeId(id),
-        name: name.into(),
-        xfrm: Some(Xfrm::new(x, y, ww, hh)),
-        ph: Some(Placeholder { kind, idx, size: (kind != PhType::SlideImage).then(|| "quarter".to_string()), ..Default::default() }),
-        text: (kind != PhType::SlideImage).then(TextBody::default),
-        ..Default::default()
-    };
-    let mut img = mk(4, "Slide Image Placeholder 3", PhType::SlideImage, 2, w * 0.125, h * 0.125, w * 0.75, h * 0.375);
-    img.fill = Some(deckcraft_model::Fill::None);
-    img.line = Some(deckcraft_model::Line::solid(deckcraft_model::ColorRef::rgb(deckcraft_color::Rgba::BLACK), 1.0));
-    let mut body = mk(5, "Notes Placeholder 4", PhType::Body, 3, w * 0.1, h * 0.53, w * 0.8, h * 0.36);
-    if let Some(t) = body.text.as_mut() {
-        t.paragraphs = vec![Paragraph::new("Click to edit Master text styles")];
-    }
-    vec![
-        mk(2, "Header Placeholder 1", PhType::Header, 0, 0.0, 0.0, w * 0.43, h * 0.05),
-        mk(3, "Date Placeholder 2", PhType::Date, 1, w * 0.57, 0.0, w * 0.43, h * 0.05),
-        img,
-        body,
-        mk(6, "Footer Placeholder 5", PhType::Footer, 4, 0.0, h * 0.95, w * 0.43, h * 0.05),
-        mk(7, "Slide Number Placeholder 6", PhType::SlideNum, 5, w * 0.57, h * 0.95, w * 0.43, h * 0.05),
-    ]
-}
-
-fn notes_style() -> deckcraft_model::text::ListStyle {
-    let mut ls = deckcraft_model::text::ListStyle::default();
-    for i in 0..9u8 {
-        ls.set(
-            i,
-            deckcraft_model::text::LevelStyle {
-                para: deckcraft_model::text::ParaProps {
-                    margin_left: Some(36.0 * i as f64),
-                    align: Some(deckcraft_model::text::Align::Left),
-                    ..Default::default()
-                },
-                run: deckcraft_model::text::RunProps {
-                    size: Some(12.0),
-                    font: Some("+mn-lt".into()),
-                    fill: Some(deckcraft_model::Fill::solid(deckcraft_model::ColorRef::scheme(deckcraft_color::SchemeSlot::Tx1))),
-                    ..Default::default()
-                },
-            },
-        );
-    }
-    ls
-}
-
-fn valid_date(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() >= 10
-        && b.iter().take(4).all(|c| c.is_ascii_digit())
-        && b.get(4) == Some(&b'-')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "-:.+TZ".contains(c))
 }
 
 /// A copy of the presentation with every slide pointing at a layout that exists.
@@ -445,7 +321,7 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
     }
 
     // Comment authors.
-    let mut authors: Vec<(String, String, u32)> = vec![];
+    let mut authors = comments::Authors::default();
     let mut n_comments = 0u32;
 
     // Slides.
@@ -466,27 +342,23 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
             x.pkg.xml_part(&nname, CT_NOTES, xml);
             x.pkg.rels(&nname, &no.rels);
         }
+        let mut comment_rid = None;
         if !s.comments.is_empty() {
             n_comments += 1;
             let cname = format!("ppt/comments/comment{n_comments}.xml");
-            so.rels.add("comments", &opc::relative(&sname, &cname), false);
-            x.pkg.xml_part(&cname, CT_COMMENTS, comments_xml(&s.comments, &mut authors));
+            comment_rid = Some(so.rels.add(crate::comments::RT_COMMENTS, &opc::relative(&sname, &cname), false));
+            let slide_id = u32::try_from(i).ok().and_then(|i| i.checked_add(256)).ok_or_else(|| PptxError::Write("too many slides".into()))?;
+            let xml = comments::slide_xml(s, slide_id, &shapes::IdMap::build(&s.shapes), &mut authors)?;
+            x.pkg.xml_part(&cname, crate::comments::CT_COMMENTS, xml);
         }
-        let xml = slide_xml(&mut x, &mut so, s);
+        let xml = slide_xml(&mut x, &mut so, s, comment_rid.as_deref());
         x.pkg.xml_part(&sname, CT_SLIDE, xml);
         x.pkg.rels(&sname, &so.rels);
         slide_rids.push(pres.rels.add("slide", &opc::relative("ppt/presentation.xml", &sname), false));
     }
     if !authors.is_empty() {
-        let name = "ppt/commentAuthors.xml";
-        let mut w = W::new();
-        root_open(&mut w, "p:cmAuthorLst", A::new());
-        for (i, (n, ini, last)) in authors.iter().enumerate() {
-            w.empty("p:cmAuthor", A::new().a("id", i).a("name", n).a("initials", ini).a("lastIdx", last).a("clrIdx", i % 8));
-        }
-        w.close("p:cmAuthorLst");
-        x.pkg.xml_part(name, CT_AUTHORS, w.finish());
-        pres.rels.add("commentAuthors", "commentAuthors.xml", false);
+        x.pkg.xml_part("ppt/authors.xml", crate::comments::CT_AUTHORS, authors.xml());
+        pres.rels.add(crate::comments::RT_AUTHORS, "authors.xml", false);
     }
 
     // Presentation-level parts.
@@ -512,316 +384,4 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
     root.add("extended-properties", "docProps/app.xml", false);
     x.pkg.rels("", &root);
     x.pkg.finish()
-}
-
-fn layout_xml(x: &mut Exp, o: &mut Out, l: &Layout) -> Vec<u8> {
-    let mut w = W::new();
-    root_open(
-        &mut w,
-        "p:sldLayout",
-        A::new().o("showMasterSp", (!l.show_master_shapes).then_some("0")).a("type", l.kind.xml()).t("preserve", l.preserve),
-    );
-    csld(&mut w, x, o, &l.name, l.background.as_ref(), &l.shapes);
-    w.open0("p:clrMapOvr");
-    w.empty0("a:masterClrMapping");
-    w.close("p:clrMapOvr");
-    ext_list(&mut w, ext_children(l.raw_ext.as_deref()).as_deref());
-    w.close("p:sldLayout");
-    w.finish()
-}
-
-fn master_xml(x: &mut Exp, o: &mut Out, m: &Master, layouts: &[(u64, String)]) -> Vec<u8> {
-    let mut w = W::new();
-    root_open(&mut w, "p:sldMaster", A::new().t("preserve", m.preserve));
-    csld(&mut w, x, o, &m.name, m.background.as_ref(), &m.shapes);
-    clr_map(&mut w, &m.color_map);
-    w.open0("p:sldLayoutIdLst");
-    for (id, rid) in layouts {
-        w.empty("p:sldLayoutId", A::new().a("id", id).a("r:id", rid));
-    }
-    w.close("p:sldLayoutIdLst");
-    w.open0("p:txStyles");
-    let (dt, db, dother) = defaults::master_styles();
-    let pick = |s: &deckcraft_model::text::ListStyle, d: deckcraft_model::text::ListStyle| if s.is_empty() { d } else { s.clone() };
-    dml::list_style(&mut w, x, o, "p:titleStyle", &pick(&m.title_style, dt));
-    dml::list_style(&mut w, x, o, "p:bodyStyle", &pick(&m.body_style, db));
-    dml::list_style(&mut w, x, o, "p:otherStyle", &pick(&m.other_style, dother));
-    w.close("p:txStyles");
-    ext_list(&mut w, ext_children(m.raw_ext.as_deref()).as_deref());
-    w.close("p:sldMaster");
-    w.finish()
-}
-
-fn slide_xml(x: &mut Exp, o: &mut Out, s: &Slide) -> Vec<u8> {
-    let mut w = W::new();
-    root_open(&mut w, "p:sld", A::new().o("showMasterSp", (!s.show_master_shapes).then_some("0")).o("show", s.hidden.then_some("0")));
-    let ids = csld(&mut w, x, o, &s.name, s.background.as_ref(), &s.shapes);
-    w.open0("p:clrMapOvr");
-    w.empty0("a:masterClrMapping");
-    w.close("p:clrMapOvr");
-    if let Some(t) = &s.transition {
-        timing::transition(&mut w, x, o, t);
-    }
-    if !s.animations.is_empty() {
-        timing::timing(&mut w, x, &s.animations, &s.shapes, &ids);
-    }
-    ext_list(&mut w, s.raw_ext.as_deref());
-    w.close("p:sld");
-    w.finish()
-}
-
-fn notes_xml(x: &mut Exp, o: &mut Out, notes: &TextBody) -> Vec<u8> {
-    let mut w = W::new();
-    root_open(&mut w, "p:notes", A::new());
-    let img = Shape {
-        id: ShapeId(2),
-        name: "Slide Image Placeholder 1".into(),
-        ph: Some(Placeholder { kind: PhType::SlideImage, ..Default::default() }),
-        ..Default::default()
-    };
-    let mut tb = notes.clone();
-    tb.body = Default::default();
-    let body = Shape {
-        id: ShapeId(3),
-        name: "Notes Placeholder 2".into(),
-        ph: Some(Placeholder { kind: PhType::Body, idx: 1, ..Default::default() }),
-        text: Some(tb),
-        ..Default::default()
-    };
-    csld(&mut w, x, o, "", None, &[img, body]);
-    w.open0("p:clrMapOvr");
-    w.empty0("a:masterClrMapping");
-    w.close("p:clrMapOvr");
-    w.close("p:notes");
-    w.finish()
-}
-
-fn comments_xml(list: &[Comment], authors: &mut Vec<(String, String, u32)>) -> Vec<u8> {
-    let mut w = W::new();
-    root_open(&mut w, "p:cmLst", A::new());
-    let mut flat: Vec<&Comment> = vec![];
-    for c in list.iter().take(10_000) {
-        flat.push(c);
-        for r in c.replies.iter().take(1000) {
-            flat.push(r);
-        }
-    }
-    for c in flat {
-        let author = if c.author.is_empty() { "Author".to_string() } else { c.author.clone() };
-        let ai = match authors.iter().position(|(n, _, _)| *n == author) {
-            Some(i) => i,
-            None => {
-                let ini = if c.initials.is_empty() { author.chars().filter(|c| c.is_alphabetic()).take(2).collect() } else { c.initials.clone() };
-                authors.push((author.clone(), ini, 0));
-                authors.len() - 1
-            }
-        };
-        let idx = match authors.get_mut(ai) {
-            Some(a) => {
-                a.2 += 1;
-                a.2
-            }
-            None => 1,
-        };
-        let dt = if valid_date(&c.date) { c.date.clone() } else { "2024-01-01T00:00:00.000".into() };
-        w.open("p:cm", A::new().a("authorId", ai).a("dt", dt).a("idx", idx));
-        let pos = |v: f64| if v.is_finite() { (v * 8.0).round().clamp(0.0, 1.0e9) as i64 } else { 0 };
-        w.empty("p:pos", A::new().a("x", pos(c.x)).a("y", pos(c.y)));
-        w.elt("p:text", &c.text);
-        w.close("p:cm");
-    }
-    w.close("p:cmLst");
-    w.finish()
-}
-
-/// Sections with every slide in exactly one section, in slide order.
-fn section_slides(p: &Presentation) -> Vec<(String, Vec<usize>)> {
-    let mut out: Vec<(String, Vec<usize>)> = p.sections.iter().map(|s| (s.name.clone(), vec![])).collect();
-    if out.is_empty() {
-        return out;
-    }
-    let mut cur = 0usize;
-    for (i, s) in p.slides.iter().enumerate() {
-        if let Some(k) = p.sections.iter().position(|sec| sec.slides.contains(&s.id))
-            && k >= cur
-        {
-            cur = k;
-        }
-        if let Some(sec) = out.get_mut(cur) {
-            sec.1.push(i);
-        }
-    }
-    out
-}
-
-fn presentation_xml(x: &mut Exp, o: &mut Out, masters: &[(u64, String)], notes: Option<&str>, slides: &[String]) -> Vec<u8> {
-    let p = x.p;
-    let mut w = W::new();
-    let first = (p.first_slide_number != 1).then_some(p.first_slide_number.min(9999));
-    root_open(&mut w, "p:presentation", A::new().a("saveSubsetFonts", 1).o("firstSlideNum", first));
-    w.open0("p:sldMasterIdLst");
-    for (id, rid) in masters {
-        w.empty("p:sldMasterId", A::new().a("id", id).a("r:id", rid));
-    }
-    w.close("p:sldMasterIdLst");
-    if let Some(n) = notes {
-        w.open0("p:notesMasterIdLst");
-        w.empty("p:notesMasterId", A::new().a("r:id", n));
-        w.close("p:notesMasterIdLst");
-    }
-    if !slides.is_empty() {
-        w.open0("p:sldIdLst");
-        for (i, rid) in slides.iter().enumerate() {
-            w.empty("p:sldId", A::new().a("id", 256 + i).a("r:id", rid));
-        }
-        w.close("p:sldIdLst");
-    }
-    let clamp = |v: f64| dml::emu(v).clamp(914_400, 51_206_400);
-    w.empty("p:sldSz", A::new().a("cx", clamp(p.slide_size.width)).a("cy", clamp(p.slide_size.height)));
-    w.empty("p:notesSz", A::new().a("cx", dml::emu_pos(p.notes_size.width).max(1)).a("cy", dml::emu_pos(p.notes_size.height).max(1)));
-    if !p.custom_shows.is_empty() {
-        w.open0("p:custShowLst");
-        for (i, cs) in p.custom_shows.iter().enumerate() {
-            w.open("p:custShow", A::new().a("name", &cs.name).a("id", i));
-            w.open0("p:sldLst");
-            for sid in &cs.slides {
-                if let Some(part) = x.slide_parts.get(sid).cloned() {
-                    let rid = o.rels.add("slide", &opc::relative("ppt/presentation.xml", &part), false);
-                    w.empty("p:sld", A::new().a("r:id", rid));
-                }
-            }
-            w.close("p:sldLst");
-            w.close("p:custShow");
-        }
-        w.close("p:custShowLst");
-    }
-    let dts = if p.default_text_style.is_empty() { defaults::default_text_style() } else { p.default_text_style.clone() };
-    dml::list_style(&mut w, x, o, "p:defaultTextStyle", &dts);
-    let sections = section_slides(p);
-    let raw = p.raw_ext.as_deref().filter(|r| !r.trim().is_empty());
-    if !sections.is_empty() || raw.is_some() {
-        let mut inner = W::frag();
-        if !sections.is_empty() {
-            inner.open("p:ext", A::new().a("uri", crate::SECTION_EXT_URI));
-            inner.open("p14:sectionLst", A::new().a("xmlns:p14", NS_P14));
-            for (i, (name, list)) in sections.iter().enumerate() {
-                inner.open("p14:section", A::new().a("name", name).a("id", crate::tables::guid(&format!("section:{i}:{name}"))));
-                inner.open0("p14:sldIdLst");
-                for si in list {
-                    inner.empty("p14:sldId", A::new().a("id", 256 + si));
-                }
-                inner.close("p14:sldIdLst");
-                inner.close("p14:section");
-            }
-            inner.close("p14:sectionLst");
-            inner.close("p:ext");
-        }
-        if let Some(r) = raw {
-            inner.raw(r);
-        }
-        ext_list(&mut w, Some(&inner.s));
-    }
-    w.close("p:presentation");
-    w.finish()
-}
-
-fn pres_props_xml(p: &Presentation) -> Vec<u8> {
-    let s = &p.show;
-    let mut w = W::new();
-    root_open(&mut w, "p:presentationPr", A::new());
-    w.open(
-        "p:showPr",
-        A::new()
-            .t("loop", s.loop_until_esc)
-            .a("showNarration", if s.without_narration { 0 } else { 1 })
-            .o("showAnimation", s.without_animation.then_some("0"))
-            .o("useTimings", (!s.use_timings).then_some("0")),
-    );
-    match s.show_type.as_str() {
-        "browsed" => w.empty("p:browse", A::new()),
-        "kiosk" => w.empty("p:kiosk", A::new()),
-        _ => w.empty0("p:present"),
-    }
-    let custom = s.custom_show.as_ref().and_then(|n| p.custom_shows.iter().position(|c| c.name == *n));
-    match (custom, s.range) {
-        (Some(i), _) => w.empty("p:custShow", A::new().a("id", i)),
-        (None, Some((a, b))) => w.empty("p:sldRg", A::new().a("st", a.max(1)).a("end", b.max(a).max(1))),
-        _ => w.empty0("p:sldAll"),
-    }
-    w.open0("p:penClr");
-    w.val("a:srgbClr", s.pen_color.hex());
-    w.close("p:penClr");
-    w.close("p:showPr");
-    w.close("p:presentationPr");
-    w.finish()
-}
-
-fn view_props_xml() -> Vec<u8> {
-    let mut w = W::new();
-    root_open(&mut w, "p:viewPr", A::new());
-    w.open0("p:normalViewPr");
-    w.empty("p:restoredLeft", A::new().a("sz", 15620));
-    w.empty("p:restoredTop", A::new().a("sz", 94660));
-    w.close("p:normalViewPr");
-    w.empty("p:gridSpacing", A::new().a("cx", 76200).a("cy", 76200));
-    w.close("p:viewPr");
-    w.finish()
-}
-
-fn core_xml(p: &Presentation) -> Vec<u8> {
-    let pr = &p.props;
-    let mut w = W::new();
-    w.open(
-        "cp:coreProperties",
-        A::new()
-            .a("xmlns:cp", "http://schemas.openxmlformats.org/package/2006/metadata/core-properties")
-            .a("xmlns:dc", "http://purl.org/dc/elements/1.1/")
-            .a("xmlns:dcterms", "http://purl.org/dc/terms/")
-            .a("xmlns:dcmitype", "http://purl.org/dc/dcmitype/")
-            .a("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance"),
-    );
-    for (tag, v) in [
-        ("dc:title", &pr.title),
-        ("dc:subject", &pr.subject),
-        ("dc:creator", &pr.author),
-        ("cp:keywords", &pr.keywords),
-        ("dc:description", &pr.comments),
-        ("cp:category", &pr.category),
-        ("cp:lastModifiedBy", &pr.last_modified_by),
-    ] {
-        if !v.is_empty() {
-            w.elt(tag, v);
-        }
-    }
-    if pr.revision > 0 {
-        w.elt("cp:revision", &pr.revision.to_string());
-    }
-    for (tag, v) in [("dcterms:created", &pr.created), ("dcterms:modified", &pr.modified)] {
-        if valid_date(v) {
-            w.open(tag, A::new().a("xsi:type", "dcterms:W3CDTF"));
-            w.text(v);
-            w.close(tag);
-        }
-    }
-    w.close("cp:coreProperties");
-    w.finish()
-}
-
-fn app_xml(p: &Presentation) -> Vec<u8> {
-    let mut w = W::new();
-    w.open(
-        "Properties",
-        A::new()
-            .a("xmlns", "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties")
-            .a("xmlns:vt", "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"),
-    );
-    w.elt("Application", "DeckCraft");
-    w.elt("Slides", &p.slides.len().to_string());
-    w.elt("Notes", &p.slides.iter().filter(|s| !s.notes.is_empty()).count().to_string());
-    w.elt("HiddenSlides", &p.slides.iter().filter(|s| s.hidden).count().to_string());
-    if !p.props.company.is_empty() {
-        w.elt("Company", &p.props.company);
-    }
-    w.close("Properties");
-    w.finish()
 }

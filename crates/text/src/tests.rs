@@ -1,4 +1,5 @@
 use super::*;
+use deckcraft_geom::Point;
 use deckcraft_model::defaults;
 use deckcraft_model::text::{Paragraph, Run};
 use deckcraft_model::{LayoutType, Presentation, Xfrm};

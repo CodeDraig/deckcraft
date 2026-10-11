@@ -9,11 +9,17 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod services;
+use services::services;
+
+mod preferences;
+use preferences::{load_prefs, save_prefs};
+
 mod audio;
 mod control_server;
 
 use deckcraft_engine::Session;
-use deckcraft_ui_egui::{Services, SlideApp};
+use deckcraft_ui_egui::SlideApp;
 
 struct App(SlideApp);
 
@@ -29,91 +35,6 @@ impl eframe::App for App {
     }
     fn on_exit(&mut self) {
         save_prefs(&self.0);
-    }
-}
-
-fn prefs_path() -> Option<std::path::PathBuf> {
-    let base = if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Application Support/DeckCraft"))
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("DeckCraft"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-            .map(|c| c.join("deckcraft"))
-    };
-    base.map(|b| b.join("ui.json"))
-}
-
-fn load_prefs(app: &mut SlideApp) {
-    if std::env::var_os("DECKCRAFT_NO_PREFS").is_some() {
-        return;
-    }
-    if let Some(p) = prefs_path()
-        && let Ok(bytes) = std::fs::read(&p)
-        && let Ok(ui) = serde_json::from_slice::<deckcraft_ui_egui::UiState>(&bytes)
-    {
-        app.ui = ui;
-    }
-    if let Some(p) = prefs_path().map(|p| p.with_file_name("prefs.json"))
-        && let Ok(bytes) = std::fs::read(&p)
-        && let Ok(prefs) = serde_json::from_slice::<deckcraft_engine::Prefs>(&bytes)
-    {
-        app.session.prefs = prefs;
-    }
-}
-
-fn save_prefs(app: &SlideApp) {
-    if std::env::var_os("DECKCRAFT_NO_PREFS").is_some() {
-        return;
-    }
-    if let Some(p) = prefs_path() {
-        let _ = std::fs::create_dir_all(p.parent().unwrap_or(std::path::Path::new(".")));
-        if let Ok(bytes) = serde_json::to_vec_pretty(&app.ui) {
-            let _ = std::fs::write(&p, bytes);
-        }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&app.session.prefs) {
-            let _ = std::fs::write(p.with_file_name("prefs.json"), bytes);
-        }
-    }
-}
-
-fn services() -> Services {
-    Services {
-        pick_open: Some(Box::new(|purpose: &str| {
-            let d = rfd::FileDialog::new();
-            let d = match purpose {
-                "picture" => d.add_filter("Pictures", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"]),
-                "audio" => d.add_filter(
-                    "Audio",
-                    &["wav", "mp3", "m4a", "m4b", "aac", "flac", "ogg", "oga", "opus", "aif", "aiff", "aifc", "caf", "wma", "weba", "mka"],
-                ),
-                "video" => d.add_filter("Video", &["mp4", "m4v", "mov", "webm", "mkv", "wmv"]),
-                _ => d
-                    .add_filter("Presentations", &["deckcraft", "pptx", "potx", "ppsx"])
-                    .add_filter("DeckCraft", &["deckcraft"])
-                    .add_filter("PowerPoint", &["pptx", "potx", "ppsx"])
-                    .add_filter("Outline", &["txt", "md"]),
-            };
-            d.pick_file().map(|p| p.to_string_lossy().to_string())
-        })),
-        pick_save: Some(Box::new(|name: &str| rfd::FileDialog::new().set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string()))),
-        read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))),
-        write: Some(Box::new(|p: &str, b: &[u8]| std::fs::write(p, b).map_err(|e| e.to_string()))),
-        clipboard_image: Some(Box::new(|| {
-            let mut cb = arboard::Clipboard::new().ok()?;
-            let img = cb.get_image().ok()?;
-            let rgba = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())?;
-            let mut out = Vec::new();
-            rgba.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
-            Some(out)
-        })),
-        // Media is mixed and clocked by the output device; `DECKCRAFT_NO_AUDIO` plays silently.
-        audio_out: std::env::var_os("DECKCRAFT_NO_AUDIO")
-            .is_none()
-            .then(|| Box::new(audio::CpalOut::default()) as Box<dyn deckcraft_media::AudioOut>),
-        ..Default::default()
     }
 }
 
